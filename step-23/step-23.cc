@@ -38,6 +38,8 @@
 #include <deal.II/dofs/dof_tools.h>
 
 #include <deal.II/fe/fe_q.h>
+#include <deal.II/fe/fe_simplex_p.h>
+#include <deal.II/fe/mapping_fe.h>
 
 #include <deal.II/numerics/data_out.h>
 
@@ -76,6 +78,13 @@
 // even if we are still in the single or double digit time steps.
 #include <deal.II/base/utilities.h>
 
+// AMR
+#include <deal.II/grid/grid_refinement.h>
+#include <deal.II/numerics/error_estimator.h>
+#include <deal.II/numerics/solution_transfer.h>
+
+#include <chrono>
+
 // The last step is as in all previous programs:
 namespace Step23 {
 using namespace dealii;
@@ -111,10 +120,14 @@ private:
   void setup_system();
   void solve_u();
   void solve_v();
+  void refine_mesh(const unsigned int min_grid_level,
+                   const unsigned int max_grid_level);
   void output_results() const;
 
   Triangulation<dim> triangulation;
+  Triangulation<dim> Th;
   FE_Q<dim> fe;
+  //  FE_SimplexP<dim> fe;
   DoFHandler<dim> dof_handler;
 
   AffineConstraints<double> constraints;
@@ -224,27 +237,31 @@ public:
 // introduction):
 template <int dim>
 WaveEquation<dim>::WaveEquation()
-    : fe(1), dof_handler(triangulation), time_step(1. / 64), time(time_step),
-      timestep_number(1), theta(0.5) {}
+    : fe(1), dof_handler(Th), time_step(1. / 64), time(time_step),
+      timestep_number(1), theta(0.5 + 50 * time_step) {} //
 
 // @sect4{WaveEquation::setup_system}
 
-// The next function is the one that sets up the mesh, DoFHandler, and
+// The next function is the one that sets up the DoFHandler, and
 // matrices and vectors at the beginning of the program, i.e. before the
 // first time step. The first few lines are pretty much standard if you've
 // read through the tutorial programs at least up to step-6:
 template <int dim> void WaveEquation<dim>::setup_system() {
-  GridGenerator::hyper_cube(triangulation, -1, 1);
-  triangulation.refine_global(7);
-
-  std::cout << "Number of active cells: " << triangulation.n_active_cells()
-            << std::endl;
 
   dof_handler.distribute_dofs(fe);
 
-  std::cout << "Number of degrees of freedom: " << dof_handler.n_dofs()
+  std::cout << std::endl
+            << "===========================================" << std::endl
+            << "Number of active cells: " << triangulation.n_active_cells()
+            << std::endl
+            << "Number of degrees of freedom: " << dof_handler.n_dofs()
             << std::endl
             << std::endl;
+
+  // add for AMR
+  constraints.clear();
+  DoFTools::make_hanging_node_constraints(dof_handler, constraints);
+  constraints.close();
 
   DynamicSparsityPattern dsp(dof_handler.n_dofs(), dof_handler.n_dofs());
   DoFTools::make_sparsity_pattern(dof_handler, dsp);
@@ -285,6 +302,10 @@ template <int dim> void WaveEquation<dim>::setup_system() {
                                     mass_matrix);
   MatrixCreator::create_laplace_matrix(dof_handler, QGauss<dim>(fe.degree + 1),
                                        laplace_matrix);
+  // MatrixCreator::create_mass_matrix(
+  //     dof_handler, QGaussSimplex<dim>(fe.degree + 1), mass_matrix);
+  // MatrixCreator::create_laplace_matrix(
+  //     dof_handler, QGaussSimplex<dim>(fe.degree + 1), laplace_matrix);
 
   // The rest of the function is spent on setting vector sizes to the
   // correct value. The final line closes the hanging node constraints
@@ -298,7 +319,7 @@ template <int dim> void WaveEquation<dim>::setup_system() {
   old_solution_v.reinit(dof_handler.n_dofs());
   system_rhs.reinit(dof_handler.n_dofs());
 
-  constraints.close();
+  // constraints.close();
 }
 
 // @sect4{WaveEquation::solve_u and WaveEquation::solve_v}
@@ -364,6 +385,120 @@ template <int dim> void WaveEquation<dim>::output_results() const {
   data_out.write_vtu(output);
 }
 
+// @sect3.5{<code>WaveEquation::refine_mesh</code>}
+//
+// This function is the interesting part of the program. It takes care of
+// the adaptive mesh refinement. The three tasks
+// this function performs is to first find out which cells to
+// refine/coarsen, then to actually do the refinement and eventually
+// transfer the solution vectors between the two different grids. The first
+// task is simply achieved by using the well-established Kelly error
+// estimator on the solution. The second task is to actually do the
+// remeshing. That involves only basic functions as well, such as the
+// <code>refine_and_coarsen_fixed_fraction</code> that refines those cells
+// with the largest estimated error that together make up 60 per cent of the
+// error, and coarsens those cells with the smallest error that make up for
+// a combined 40 per cent of the error. Note that for problems such as the
+// current one where the areas where something is going on are shifting
+// around, we want to aggressively coarsen so that we can move cells
+// around to where it is necessary.
+//
+// As already discussed in the introduction, too small a mesh leads to
+// too small a time step, whereas too large a mesh leads to too little
+// resolution. Consequently, after the first two steps, we have two
+// loops that limit refinement and coarsening to an allowable range of
+// cells:
+template <int dim>
+void WaveEquation<dim>::refine_mesh(const unsigned int min_grid_level,
+                                    const unsigned int max_grid_level) {
+  Vector<float> estimated_error_per_cell(Th.n_active_cells());
+
+  std::cout << "* RefineMesh" << std::endl;
+  std::cout << "min_grid_level = " << min_grid_level << std::endl;
+  std::cout << "max_grid_level = " << max_grid_level << std::endl;
+  std::cout << "Th.n_levels()= " << Th.n_levels() << std::endl;
+
+  KellyErrorEstimator<dim>::estimate(
+      dof_handler, QGauss<dim - 1>(fe.degree + 1),
+      std::map<types::boundary_id, const Function<dim> *>(), solution_u,
+      estimated_error_per_cell);
+
+  GridRefinement::refine_and_coarsen_fixed_fraction(
+      Th, estimated_error_per_cell, 0.6, 0.4);
+
+  // do not refine mesh that is already at the max refinement level
+  if (Th.n_levels() > max_grid_level)
+    for (const auto &cell : Th.active_cell_iterators_on_level(max_grid_level))
+      cell->clear_refine_flag();
+  // do not coarsen mesh that is already at the min refinement level
+  for (const auto &cell : Th.active_cell_iterators_on_level(min_grid_level))
+    cell->clear_coarsen_flag();
+  // These two loops above are slightly different but this is easily
+  // explained. In the first loop, instead of calling
+  // <code>triangulation.end()</code> we may as well have called
+  // <code>triangulation.end_active(max_grid_level)</code>. The two
+  // calls should yield the same iterator since iterators are sorted
+  // by level and there should not be any cells on levels higher than
+  // on level <code>max_grid_level</code>. In fact, this very piece
+  // of code makes sure that this is the case.
+
+  // As part of mesh refinement we need to transfer the solution vectors
+  // from the old mesh to the new one. To this end we use the
+  // SolutionTransfer class and we have to prepare the solution vectors that
+  // should be transferred to the new grid (we will lose the old grid once
+  // we have done the refinement so the transfer has to happen concurrently
+  // with refinement). At the point where we call this function, we will
+  // have just computed the solution, so we no longer need the old_solution
+  // variable (it will be overwritten by the solution just after the mesh
+  // may have been refined, i.e., at the end of the time step; see below).
+  // In other words, we only need the one solution vector, and we copy it
+  // to a temporary object where it is safe from being reset when we further
+  // down below call <code>setup_system()</code>.
+  //
+  // Consequently, we initialize a SolutionTransfer object by attaching
+  // it to the old DoF handler. We then prepare the triangulation and the
+  // data vector for refinement (in this order).
+  SolutionTransfer<dim> solution_transfer(dof_handler);
+
+  Th.prepare_coarsening_and_refinement();
+
+  Vector<double> previous_solution_u;
+  previous_solution_u = solution_u;
+  Vector<double> previous_solution_v;
+  previous_solution_v = solution_v;
+  std::vector<Vector<double>> all_in{previous_solution_u, previous_solution_v};
+
+  std::cout << "all_in[0].size()=" << all_in[0].size() << std::endl;
+  std::cout << "all_in[1].size()=" << all_in[1].size() << std::endl;
+  std::cout << "dof_handler->n_dofs()=" << dof_handler.n_dofs() << std::endl;
+
+  solution_transfer.prepare_for_coarsening_and_refinement(all_in);
+
+  // Now everything is ready, so do the refinement and recreate the DoF
+  // structure on the new grid, and finally initialize the matrix structures
+  // and the new vectors in the <code>setup_system</code> function. Next, we
+  // actually perform the interpolation of the solution from old to new
+  // grid. The final step is to apply the hanging node constraints to the
+  // solution vector, i.e., to make sure that the values of degrees of
+  // freedom located on hanging nodes are so that the solution is
+  // continuous. This is necessary since SolutionTransfer only operates on
+  // cells locally, without regard to the neighborhood.
+  Th.execute_coarsening_and_refinement();
+  setup_system();
+
+  std::vector<Vector<double>> all_out(2);
+  all_out[0].reinit(solution_u);
+  all_out[1].reinit(solution_v);
+
+  solution_transfer.interpolate(all_in, all_out);
+
+  solution_u = all_out[0];
+  solution_v = all_out[1];
+
+  constraints.distribute(solution_u);
+  constraints.distribute(solution_v);
+}
+
 // @sect4{WaveEquation::run}
 
 // The following is really the only interesting function of the program. It
@@ -375,12 +510,21 @@ template <int dim> void WaveEquation<dim>::output_results() const {
 // onto the finite element space described by the DoFHandler object. Can't
 // be any simpler than that:
 template <int dim> void WaveEquation<dim>::run() {
+  const unsigned int initial_global_refinement = 4;       // 2;
+  const unsigned int n_adaptive_pre_refinement_steps = 4; // 4;
+  GridGenerator::hyper_cube(triangulation, -1, 1);
+  // GridGenerator::convert_hypercube_to_simplex_mesh(triangulation, Th);
+  Th.copy_triangulation(triangulation);
+  Th.refine_global(initial_global_refinement);
+  std::cout << "Th.n_levels()=" << Th.n_levels() << std::endl;
+  std::cout << "triangulation.n_levels()=" << triangulation.n_levels()
+            << std::endl;
+
+  std::cout << "Number of active cells: " << Th.n_active_cells() << std::endl;
+
   setup_system();
 
-  VectorTools::project(dof_handler, constraints, QGauss<dim>(fe.degree + 1),
-                       InitialValuesU<dim>(), old_solution_u);
-  VectorTools::project(dof_handler, constraints, QGauss<dim>(fe.degree + 1),
-                       InitialValuesV<dim>(), old_solution_v);
+  unsigned int pre_refinement_step = 0;
 
   // The next thing is to loop over all the time steps until we reach the
   // end time ($T=5$ in this case). In each time step, we first have to
@@ -404,10 +548,36 @@ template <int dim> void WaveEquation<dim>::run() {
   // we almost always work on a single time step at a time, and where it
   // never happens that, for example, one would like to evaluate a
   // space-time function for all times at any given spatial location.
-  Vector<double> tmp(solution_u.size());
-  Vector<double> forcing_terms(solution_u.size());
+  Vector<double> tmp;
+  Vector<double> forcing_terms;
 
-  for (; time <= 5; time += time_step, ++timestep_number) {
+start_time_iteration:
+
+  time = 0.0;
+  timestep_number = 0;
+
+  tmp.reinit(solution_u.size());
+  forcing_terms.reinit(solution_u.size());
+
+  // VectorTools::project(dof_handler, constraints,
+  //                      QGaussSimplex<dim>(fe.degree + 1),
+  //                      InitialValuesU<dim>(), old_solution_u);
+  // VectorTools::project(dof_handler, constraints,
+  //                      QGaussSimplex<dim>(fe.degree + 1),
+  //                      InitialValuesV<dim>(), old_solution_v);
+
+  VectorTools::interpolate(dof_handler, Functions::ZeroFunction<dim>(),
+                           old_solution_u);
+  VectorTools::interpolate(dof_handler, Functions::ZeroFunction<dim>(),
+                           old_solution_v);
+  solution_u = old_solution_u;
+  solution_v = old_solution_v;
+
+  output_results();
+
+  while (time <= 5) {
+    time += time_step;
+    ++timestep_number;
     std::cout << "Time step " << timestep_number << " at t=" << time
               << std::endl;
 
@@ -423,12 +593,16 @@ template <int dim> void WaveEquation<dim>::run() {
     rhs_function.set_time(time);
     VectorTools::create_right_hand_side(dof_handler, QGauss<dim>(fe.degree + 1),
                                         rhs_function, tmp);
+    // VectorTools::create_right_hand_side(
+    //     dof_handler, QGaussSimplex<dim>(fe.degree + 1), rhs_function, tmp);
     forcing_terms = tmp;
     forcing_terms *= theta * time_step;
 
     rhs_function.set_time(time - time_step);
     VectorTools::create_right_hand_side(dof_handler, QGauss<dim>(fe.degree + 1),
                                         rhs_function, tmp);
+    // VectorTools::create_right_hand_side(
+    //     dof_handler, QGaussSimplex<dim>(fe.degree + 1), rhs_function, tmp);
 
     forcing_terms.add((1 - theta) * time_step, tmp);
 
@@ -511,6 +685,37 @@ template <int dim> void WaveEquation<dim>::run() {
                      2
               << std::endl;
 
+    // ...take care of mesh refinement. Here, what we want to do is
+    // (i) refine the requested number of times at the very beginning
+    // of the solution procedure, after which we jump to the top to
+    // restart the time iteration, (ii) refine every fifth time
+    // step after that.
+    //
+    // The time loop and, indeed, the main part of the program ends
+    // with starting into the next time step by setting old_solution
+    // to the solution we have just computed.
+    if ((timestep_number == 1) &&
+        (pre_refinement_step < n_adaptive_pre_refinement_steps)) {
+      refine_mesh(initial_global_refinement,
+                  initial_global_refinement + n_adaptive_pre_refinement_steps);
+      ++pre_refinement_step;
+
+      tmp.reinit(solution_u.size());
+      forcing_terms.reinit(solution_u.size());
+
+      std::cout << std::endl;
+
+      std::cout << "timestep_number = " << timestep_number << std::endl;
+      std::cout << "pre_refinement_step= " << pre_refinement_step << std::endl;
+
+      goto start_time_iteration;
+    } else if ((timestep_number > 0) && (timestep_number % 5 == 0)) {
+      refine_mesh(initial_global_refinement,
+                  initial_global_refinement + n_adaptive_pre_refinement_steps);
+      tmp.reinit(solution_u.size());
+      forcing_terms.reinit(solution_u.size());
+    }
+
     old_solution_u = solution_u;
     old_solution_v = solution_v;
   }
@@ -522,6 +727,13 @@ template <int dim> void WaveEquation<dim>::run() {
 // What remains is the main function of the program. There is nothing here
 // that hasn't been shown in several of the previous programs:
 int main() {
+
+  using std::chrono::duration;
+  using std::chrono::duration_cast;
+  using std::chrono::high_resolution_clock;
+  using std::chrono::milliseconds;
+
+  auto t1 = high_resolution_clock::now();
   try {
     using namespace Step23;
 
@@ -550,6 +762,17 @@ int main() {
               << std::endl;
     return 1;
   }
+
+  auto t2 = high_resolution_clock::now();
+
+  /* Getting number of milliseconds as an integer. */
+  auto ms_int = duration_cast<milliseconds>(t2 - t1);
+
+  /* Getting number of milliseconds as a double. */
+  duration<double, std::milli> ms_double = t2 - t1;
+
+  std::cout << ms_int.count() << "ms\n";
+  std::cout << ms_double.count() << "ms\n";
 
   return 0;
 }
